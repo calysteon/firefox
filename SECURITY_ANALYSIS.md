@@ -90,6 +90,45 @@ passes `{ValidatePrincipalOptions::AllowSystem}`, meaning SystemPrincipal passes
 validation. A compromised content process can register blob: URLs with
 SystemPrincipal, which could be loaded in privileged contexts.
 
+### Principal Forgery Mechanism
+
+SystemPrincipal is trivially forgeable over IPC. The IPDL type definition at
+`ipc/glue/PBackgroundSharedTypes.ipdlh` lines 45-46 defines `SystemPrincipalInfo`
+as an empty struct. The `PrincipalInfo` union (lines 60-66) allows this variant.
+
+Deserialization at `ipc/glue/BackgroundUtils.cpp` lines 54-55:
+```cpp
+case PrincipalInfo::TSystemPrincipalInfo: {
+    principal = SystemPrincipal::Get();  // Creates a real SystemPrincipal
+}
+```
+
+A compromised content process crafts an IPC message with the `TSystemPrincipalInfo`
+discriminant. The parent deserializes it into a real `SystemPrincipal` object.
+
+### Most Dangerous Handlers (NO AllowSystem flag)
+
+These handlers call `ValidatePrincipal` WITHOUT `AllowSystem`, so SystemPrincipal
+FAILS validation, but execution continues in release:
+
+| Handler | Line | Impact of Forged SystemPrincipal |
+|---------|------|--------------------------------|
+| `RecvCreateWindow` | 4143 | Creates `WindowGlobalParent` with SystemPrincipal -- parent believes window has chrome privileges |
+| `RecvNotifyPushObservers` | 5711 | Dispatches push events under arbitrary principal, can wake service workers for other origins |
+| `RecvAutomaticStorageAccessPermissionCanBeGranted` | 6569 | Grants storage access permissions to arbitrary origins |
+| `RecvContentBlockingUserInteraction` | 6652 | Records content blocking interactions for arbitrary origins |
+| `RecvPURLClassifierConstructor` | 6392 | URL classification with forged principal |
+
+### Exploitation Path: RecvCreateWindow
+
+1. Compromised content process serializes `PrincipalInfo` with `TSystemPrincipalInfo`
+2. Parent deserializes into real `SystemPrincipal` at `BackgroundUtils.cpp:54`
+3. `ValidatePrincipal` at line 4143 returns false (no `AllowSystem`)
+4. `LogAndAssertFailedPrincipalValidationInfo` logs only, returns normally in release
+5. `WindowGlobalParent::CreateDisconnected(aInitialWindowInit)` at line 4190 creates
+   a `WindowGlobalParent` with SystemPrincipal
+6. Subsequent security checks querying this window's principal see SystemPrincipal
+
 ### Suggested Fix
 
 Each call site should return `IPC_FAIL` when validation fails:
@@ -184,26 +223,65 @@ this IPC endpoint entirely and handle cert exceptions only in the parent.
 
 `MutableSharedMemoryHandle` is used to pass buffer data from the content
 process to wgpu processing. The content process retains write access to the
-shared memory. The parent/GPU process reads and validates the data, then
-reads it again for processing.
+shared memory. The parent/GPU process reads from shmem via raw pointers
+without copying the data first.
 
-On Linux, WebGPU runs in the **parent process** (not a separate GPU process),
-making this a potential sandbox escape.
+**IPDL definition** (`dom/webgpu/ipc/PWebGPU.ipdl` line 44):
+```
+async Messages(uint32_t nrOfMessages, ByteBuf serializedMessages,
+               ByteBuf[] dataBuffers, MutableSharedMemoryHandle[] shmems);
+```
 
-### Exploitation
+**C++ mapping** (`WebGPUParent.cpp:1580-1617`):
+```cpp
+for (const auto& shmem : aShmems) {
+    auto mapping = shmem.Map();
+    auto* ptr = mapping.DataAs<uint8_t>();  // Raw pointer into shmem
+    // Content process STILL HAS WRITE ACCESS to *ptr
+    ffi::WGPUFfiSlice_u8 byte_slice{ptr, len};
+    shmem_mappings.AppendElement(std::move(byte_slice));
+}
+// Raw shmem pointers passed directly to Rust wgpu
+ffi::wgpu_server_messages(mContext.get(), ..., shmem_mapping_slices);
+```
 
-1. Content process allocates shared memory for WebGPU buffer upload
-2. Content process fills buffer with valid data
-3. Content sends IPC message triggering parent-side processing
-4. Parent validates buffer metadata
-5. Content process (on another thread) modifies buffer contents
-6. Parent reads modified data for GPU command processing
-7. Modified data could cause GPU driver bugs or parent-process corruption
+**Rust consumption** (`gfx/wgpu_bindings/src/server.rs:2670-2695`):
+```rust
+QueueWriteDataSource::Shmem(shmem_handle_index) => {
+    shmem_mappings.as_slice()[shmem_handle_index].as_slice()
+    // DIRECT READ FROM MUTABLE SHARED MEMORY
+}
+```
+
+### Three TOCTOU Paths
+
+1. **queue_write_buffer**: Rust calls `global.queue_write_buffer(queue_id, dst,
+   offset, data)` where `data` points into mutable shmem. Content modifies data
+   during `copy_nonoverlapping` in `StagingBuffer::write` (`wgpu-core/src/resource.rs:1167`).
+
+2. **queue_write_texture**: Row-by-row copy reads from shmem multiple times.
+   Content can modify data between row copies, feeding inconsistent texture data
+   (especially dangerous for compressed texture formats).
+
+3. **BufferUnmap flush** (`WebGPUParent.cpp:758-803`): `memcpy(mapped.ptr,
+   src.data(), size)` where `src.data()` is in persistent shmem mapping.
+
+### Platform Impact
+
+- **Linux X11/Wayland** (`layers.gpu-process.enabled = false` at
+  `modules/libpref/init/StaticPrefList.yaml:9753`): WebGPU runs in the
+  **parent process**. TOCTOU directly affects the parent. A GPU driver
+  exploit triggered through corrupted data = sandbox escape.
+- **Windows/macOS/Android** (GPU process enabled): WebGPU runs in the GPU
+  process. Corruption affects GPU process, not parent directly.
 
 ### Suggested Fix
 
-Use `ReadOnlySharedMemoryHandle` or copy buffer data to a parent-owned
-allocation before processing.
+Use `FreezableSharedMemoryHandle` (which creates a truly read-only mapping
+the sender cannot modify) or copy data out of shmem before processing.
+The comment at `ipc/glue/SharedMemoryHandle.h:155-157` warns that converting
+MutableHandle to ReadOnlyHandle provides no security guarantees on the
+underlying memory.
 
 ---
 
